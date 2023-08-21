@@ -6,14 +6,14 @@ use ndrustfft::{
 };
 use std::fs::File;
 use std::f64::consts::{PI, TAU};
-use std::ops::{SubAssign, AddAssign};
+use std::ops::{SubAssign, AddAssign, MulAssign};
 use anyhow;
 
 
 
 fn main() -> anyhow::Result<()> {
-    let wphase = Array2::<f64>::read_npy(File::open("./wphase_f64.npy")?)?;
-    let amp = Array2::<f64>::read_npy(File::open("./amp_f64.npy")?)?;
+    let wphase = Array2::<f64>::read_npy(File::open("./wphase_cropped.npy")?)?;
+    let amp = Array2::<f64>::read_npy(File::open("./amp_cropped.npy")?)?;
     let mean_amp = amp.mean().unwrap();
 
     println!("Loaded wphase array of shape {:?}", wphase.dim());
@@ -33,12 +33,12 @@ fn main() -> anyhow::Result<()> {
     dct_solve_iterative(wphase.view(), weights.view(), uphase.view_mut());
     println!("Done.");
 
-    let wff_in = wphase.mapv(|v| Complex { re: v, im: 0. });
+    let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
     let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
     
-    let window = Array2::<Complex<f64>>::from_shape_fn((5, 5), |(i, j)| {
+    let window = Array2::<Complex<f64>>::from_shape_fn((10, 10), |(i, j)| {
         Complex {
-            re: (-(i as f64-2.).powf(2.)-(j as f64-2.).powf(2.)).exp(),
+            re: (-(i as f64-5.).powf(2.)/6.-(j as f64-5.).powf(2.)/6.).exp(),
             im: 0.
         }
     });
@@ -68,41 +68,34 @@ fn wff_filter(
     let (h, w) = arr.dim();
     let (m, n) = window.dim();
 
-    let mut handler_x = ndrustfft::FftHandler::<f64>::new(n);
-    let mut handler_y = ndrustfft::FftHandler::<f64>::new(m);
-    let mut windowed = Array2::<Complex<f64>>::zeros((m, n));
-    let mut temp = Array2::<Complex<f64>>::zeros((m, n));
-    let mut expanded = Array2::<Complex<f64>>::zeros((h+m, w+n));
-    let mut expanded_out = Array2::<Complex<f64>>::zeros((h+m, w+n));
+    let mut handler_x = ndrustfft::FftHandler::<f64>::new(w);
+    let mut handler_y = ndrustfft::FftHandler::<f64>::new(h);
+    let mut windowed = Array2::<Complex<f64>>::zeros((h, w));
+    let mut temp = Array2::<Complex<f64>>::zeros((h, w));
     
-    let freqs = fft2_freqs(m, n);
+    let freqs = fft2_freqs(w, h);
     let threshold = 0.6*(m as f64).hypot(n as f64);
-
-    let (rx0, ry0) = (n/2, m/2);
-    let (rx1, ry1) = (rx0+w, ry0+h);
-
-    expanded.slice_mut(s![ry0..ry1, rx0..rx1]).assign(&arr);
-    expanded.slice_mut(s![..ry0, ..rx0]).assign(&arr.slice(s![..ry0;-1, ..rx0;-1]));
-    expanded.slice_mut(s![..ry0, rx0..rx1]).assign(&arr.slice(s![..ry0;-1, ..]));
-    expanded.slice_mut(s![..ry0, rx1..]).assign(&arr.slice(s![..ry0;-1, rx1-n..;-1]));
-    expanded.slice_mut(s![ry0..ry1, rx1..]).assign(&arr.slice(s![.., rx1-n..;-1]));
-    expanded.slice_mut(s![ry1.., rx1..]).assign(&arr.slice(s![ry1-m..;-1, rx1-n..;-1]));
-    expanded.slice_mut(s![ry1.., rx0..rx1]).assign(&arr.slice(s![ry1-m..;-1, ..]));
-    expanded.slice_mut(s![ry1.., ..rx0]).assign(&arr.slice(s![ry1-m..;-1, ..rx0;-1]));
-    expanded.slice_mut(s![ry0..ry1, ..rx0]).assign(&arr.slice(s![.., ..rx0;-1]));
 
     for i in 0..h {
         for j in 0..w {
+            println!("Calculating row {i} col {j} out of {h}x{w}");
+
+            let (i0, wi0) = if i < m/2 { (0, m/2-i) } else { (i-m/2, 0) };
+            let (j0, wj0) = if j < n/2 { (0, n/2-j) } else { (j-n/2, 0) };
+            let (i1, wi1) = if i+(m-m/2) > h { (h, m/2+h-i) } else { (i+(m-m/2), m) };
+            let (j1, wj1) = if j+(n-n/2) > w { (w, n/2+w-j) } else { (j+(n-n/2), n) };
+
             // --- Forward WFT ---
-            windowed.assign(&expanded.slice(s![i..i+m, j..j+n]));
-            windowed *= &window;
+            windowed.assign(&arr);
+            windowed.slice_mut(s![..i0, ..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i1.., ..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, ..j0]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, j1..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, j0..j1])
+                .mul_assign(&window.slice(s![wi0..wi1, wj0..wj1]));
             
             ndfft_par(&windowed, &mut temp, &mut handler_x, 1);
             ndfft_par(&temp, &mut windowed, &mut handler_y, 0);
-            
-            par_azip!((f in freqs.rows(), w in &mut windowed) {
-                *w *= Complex::new(0., -TAU*(f[0]*j as f64+f[1]*i as f64)).exp();
-            });
             // -------------------
 
             par_azip!((f in freqs.rows(), w in &mut windowed) {
@@ -115,14 +108,17 @@ fn wff_filter(
             ndifft_par(&windowed, &mut temp, &mut handler_x, 1);
             ndifft_par(&temp, &mut windowed, &mut handler_y, 0);
             
-            windowed *= &window;
+            windowed.slice_mut(s![..i0, ..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i1.., ..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, ..j0]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, j1..]).fill(Complex::new(0., 0.));
+            windowed.slice_mut(s![i0..i1, j0..j1])
+                .mul_assign(&window.slice(s![wi0..wi1, wj0..wj1]));
 
-            expanded_out.slice_mut(s![i..i+m, j..j+n]).add_assign(&windowed);
+            out += &windowed;
             // -------------------
         }
     }
-
-    out.assign(&expanded_out.slice(s![ry0..ry1, rx0..rx1]));
 }
 
 // Slow Picard iterative method, algorithm 2 from Ghiglia & Romero 1994
