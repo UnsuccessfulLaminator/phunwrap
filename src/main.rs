@@ -2,14 +2,16 @@ use ndarray::prelude::*;
 use ndarray::par_azip;
 use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use ndrustfft::{
-    Complex, FftHandler, DctHandler, ndfft_par, ndifft_par, nddct2_par, nddct3_par
+    Complex, FftHandler, DctHandler,
+    ndfft, ndifft, ndfft_par, ndifft_par, nddct2_par, nddct3_par
 };
 use std::fs::File;
 use std::f64::consts::{PI, TAU};
 use std::ops::{SubAssign, AddAssign};
 use std::thread;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::path::PathBuf;
+use std::collections::BinaryHeap;
 use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser, ValueEnum};
 use anyhow;
@@ -77,41 +79,41 @@ fn main() -> anyhow::Result<()> {
     });
 
     let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
-    let wff_out = Arc::new(Mutex::new(Array2::<Complex<f64>>::zeros(wphase.dim())));
-    let wff_out_clone = wff_out.clone();
+    let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
 
     let (tx, rx) = mpsc::channel();
-    let template = "Filtering [{elapsed}] [{wide_bar:.cyan/blue}] {pos}/{len} pixels ({eta})";
+    let template = "{msg} ({elapsed}) [{wide_bar:.cyan/blue}] {pos}/{len} pixels ({eta})";
     let bar = ProgressBar::new(wphase.len() as u64);
+    let bar_clone = bar.clone();
     let bar_style = ProgressStyle::with_template(template)
         .unwrap()
         .progress_chars("#>-");
-
+    
     bar.set_style(bar_style);
+    bar.set_message("Filtering");
     
-    thread::spawn(move || {
-        let mut wff_out = wff_out_clone.lock().unwrap();
-
-        wff_filter(wff_in.view(), window.view(), threshold, wff_out.view_mut(), tx);
+    let handle = thread::spawn(move || {
+        for idx in rx.iter() {
+            bar_clone.set_position(idx as u64);
+        }
     });
-
-    for idx in rx.iter() {
-        bar.set_position(idx as u64);
-    }
-
-    bar.finish_with_message("Done");
     
-    let wff_out = Arc::try_unwrap(wff_out).unwrap().into_inner().unwrap();
+    wff_filter(wff_in.view(), window.view(), threshold, wff_out.view_mut(), tx);
+    
+    handle.join().unwrap();
+    bar.finish();
+
+    println!("");
+    
     let wphase_filtered = wff_out.mapv(|e| e.arg());
     let quality = wff_out.mapv(|e| e.norm());
-
+    
+    drop(wff_in);
     drop(wff_out);
 
     if let Some(path) = args.unwrapped.as_ref() {
         let mut uphase = Array2::<f64>::zeros(wphase.dim());
         let weights = Array2::<f64>::ones(wphase.dim());
-        
-        println!("Unwrapping...");
         
         match args.unwrap_method {
             UnwrapMethod::DCT => {
@@ -121,11 +123,23 @@ fn main() -> anyhow::Result<()> {
                 tie_solve(wphase_filtered.view(), uphase.view_mut());
             },
             UnwrapMethod::QGP => {
-                println!("Quality Guided Path not yet implemented.");
+                let (tx, rx) = mpsc::channel();
+                let bar_clone = bar.clone();
+                let handle = thread::spawn(move || {
+                    for idx in rx.iter() {
+                        bar_clone.set_position(idx as u64);
+                    }
+                });
+
+                bar.reset();
+                bar.set_message("Unwrapping");
+
+                qgpu(wphase_filtered.view(), quality.view(), uphase.view_mut(), tx);
+
+                handle.join().unwrap();
+                bar.finish();
             }
         }
-
-        println!("Done");
 
         uphase.write_npy(File::create(path)?)?;
     }
@@ -141,22 +155,106 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/*fn qgpu(wphase: ArrayView2<f64>, quality: ArrayView2<f64>, mut uphase: ArrayViewMut2<f64>) {
+#[derive(PartialEq)]
+struct Pixel {
+    ij: (usize, usize),
+    q: f64
+}
+
+impl Pixel {
+    fn new(ij: (usize, usize), q: f64) -> Self {
+        Self { ij, q }
+    }
+}
+
+impl PartialOrd for Pixel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.q.partial_cmp(&other.q)
+    }
+}
+
+impl Ord for Pixel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.q.total_cmp(&other.q)
+    }
+}
+
+impl Eq for Pixel { }
+
+fn qgpu(
+    wphase: ArrayView2<f64>,
+    quality: ArrayView2<f64>,
+    mut uphase: ArrayViewMut2<f64>,
+    idx_monitor: mpsc::Sender<usize>
+) {
+    let (h, w) = wphase.dim();
     let start = quality.indexed_iter()
         .max_by(|(_, q0), (_, q1)| q0.total_cmp(q1))
         .unwrap();
     
-    let adjacent = vec![(start, quality[start])];
+    let mut prev = Array2::<u8>::zeros((h, w));
+    let mut adjacent = BinaryHeap::<Pixel>::from([Pixel::new(start.0, *start.1)]);
+    let mut processed = 0;
+    let mut ref_ij = start.0;
 
-    while adjacent.len() > 0 {
-        let best = adjacent.iter()
-            .max_by(|(_, q0), (_, q1)| q0.total_cmp(q1))
-            .unwrap()
-            .0;
+    prev[start.0] = 1;
 
-        x
+    while let Some(best) = adjacent.pop() {
+        if best.ij.0 > 0 {
+            let ij = (best.ij.0-1, best.ij.1);
+
+            if prev[ij] == 0 {
+                adjacent.push(Pixel::new(ij, quality[ij]));
+                prev[ij] = 1;
+            }
+
+            if prev[ij] == 2 { ref_ij = ij; }
+        }
+
+        if best.ij.0 < h-1 {
+            let ij = (best.ij.0+1, best.ij.1);
+            
+            if prev[ij] == 0 {
+                adjacent.push(Pixel::new(ij, quality[ij]));
+                prev[ij] = 1;
+            }
+
+            if prev[ij] == 2 { ref_ij = ij; }
+        }
+
+        if best.ij.1 > 0 {
+            let ij = (best.ij.0, best.ij.1-1);
+            
+            if prev[ij] == 0 {
+                adjacent.push(Pixel::new(ij, quality[ij]));
+                prev[ij] = 1;
+            }
+
+            if prev[ij] == 2 { ref_ij = ij; }
+        }
+
+        if best.ij.1 < w-1 {
+            let ij = (best.ij.0, best.ij.1+1);
+            
+            if prev[ij] == 0 {
+                adjacent.push(Pixel::new(ij, quality[ij]));
+                prev[ij] = 1;
+            }
+
+            if prev[ij] == 2 { ref_ij = ij; }
+        }
+
+        uphase[best.ij] = wphase[best.ij]+TAU*((uphase[ref_ij]-wphase[best.ij])/TAU).round();
+        prev[best.ij] = 2;
+        processed += 1;
+
+        idx_monitor.send(processed).unwrap();
+
+        if processed%50000 == 0 {
+            prev.write_npy(File::create(&format!("{}.npy", processed)).unwrap()).unwrap();
+        }
     }
-}*/
+}
 
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
@@ -190,8 +288,6 @@ fn wff_filter(
     expanded.slice_mut(s![ry1.., rx0..rx1]).assign(&arr.slice(s![ry1-m..;-1, ..]));
     expanded.slice_mut(s![ry1.., ..rx0]).assign(&arr.slice(s![ry1-m..;-1, ..rx0;-1]));
     expanded.slice_mut(s![ry0..ry1, ..rx0]).assign(&arr.slice(s![.., ..rx0;-1]));
-    
-    use ndrustfft::{ndfft, ndifft};
 
     for i in 0..h {
         for j in 0..w {
