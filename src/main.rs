@@ -6,119 +6,193 @@ use ndrustfft::{
 };
 use std::fs::File;
 use std::f64::consts::{PI, TAU};
-use std::ops::{SubAssign, AddAssign, MulAssign};
+use std::ops::{SubAssign, AddAssign};
+use std::thread;
+use std::sync::{mpsc, Arc, Mutex};
+use std::path::PathBuf;
+use indicatif::{ProgressBar, ProgressStyle};
+use clap::Parser;
 use anyhow;
 
 
 
+#[derive(Parser)]
+struct Args {
+    /// Numpy array file (.npy) containing a 2D array of wrapped phases
+    wrapped: PathBuf,
+
+    /// Destination file for the unwrapped phases
+    unwrapped: PathBuf,
+    
+    #[arg(short, long, default_value_t = 1.7)]
+    /// Standard deviation of the Gaussian window used for windowed Fourier filtering
+    sigma: f64,
+
+    #[arg(short, long, default_value_t = 0.15)]
+    /// Threshold used for removing Fourier coefficients of small magnitude
+    threshold: f64,
+
+    #[arg(short, long, value_name = "FILE")]
+    /// Output the image quality map in addition to the unwrapped phase
+    quality: Option<PathBuf>,
+
+    #[arg(short, long, value_name = "FILE")]
+    /// Output the filtered wrapped phase in addition to the unwrapped phase
+    filtered: Option<PathBuf>
+}
+
+
+
 fn main() -> anyhow::Result<()> {
-    let wphase = Array2::<f64>::read_npy(File::open("./wphase_cropped.npy")?)?;
-    let amp = Array2::<f64>::read_npy(File::open("./amp_cropped.npy")?)?;
-    let mean_amp = amp.mean().unwrap();
+    let args = Args::parse();
+    let wphase = Array2::<f64>::read_npy(File::open(&args.wrapped)?)?;
 
-    println!("Loaded wphase array of shape {:?}", wphase.dim());
+    println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
     
-    let mut uphase = Array2::<f64>::zeros(wphase.dim());
-    let weights = amp.mapv(|a| if a > mean_amp { 1. } else { 0. });
-    
-    println!("Solving with TIE...");
-    tie_solve(wphase.view(), uphase.view_mut());
-    println!("Done.");
+    let sigma = args.sigma;
+    let threshold = args.threshold;
+    let window_size = (7.*sigma).round() as usize;
+    let window = Array2::from_shape_fn((window_size, window_size), |(i, j)| {
+        let x = j as f64-(window_size/2) as f64;
+        let y = i as f64-(window_size/2) as f64;
+        let gaussian = (-(x*x+y*y)/(2.*sigma*sigma)).exp()/(sigma*TAU.sqrt());
 
-    println!("Solving with DCT...");
-    dct_solve(wphase.view(), uphase.view_mut());
-    println!("Done.");
-    
-    println!("Solving with iterative DCT...");
-    dct_solve_iterative(wphase.view(), weights.view(), uphase.view_mut());
-    println!("Done.");
-
-    let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
-    let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
-    
-    let window = Array2::<Complex<f64>>::from_shape_fn((10, 10), |(i, j)| {
-        Complex {
-            re: (-(i as f64-5.).powf(2.)/6.-(j as f64-5.).powf(2.)/6.).exp(),
-            im: 0.
-        }
+        Complex::new(gaussian, 0.)
     });
 
-    println!("WFF test...");
-    wff_filter(wff_in.view(), window.view(), wff_out.view_mut());
-    println!("Done.");
+    let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
+    let wff_out = Arc::new(Mutex::new(Array2::<Complex<f64>>::zeros(wphase.dim())));
+    let wff_out_clone = wff_out.clone();
 
-    /*let mut f = BufWriter::new(File::create("data")?);
- 
-    for ((i, j), &u) in uphase.indexed_iter() {
-        write!(f, "{j} {i} {}\n", u)?;
-    }*/
+    let (tx, rx) = mpsc::channel();
+    let template = "Filtering [{elapsed}] [{wide_bar:.cyan/blue}] {pos}/{len} pixels ({eta})";
+    let bar = ProgressBar::new(wphase.len() as u64);
+    let bar_style = ProgressStyle::with_template(template)
+        .unwrap()
+        .progress_chars("#>-");
 
-    uphase.write_npy(File::create("uphase.npy")?)?;
-    wff_out.mapv(|v| v.re).write_npy(File::create("wff_re.npy")?)?;
-    wff_out.mapv(|v| v.im).write_npy(File::create("wff_im.npy")?)?;
+    bar.set_style(bar_style);
+    
+    thread::spawn(move || {
+        let mut wff_out = wff_out_clone.lock().unwrap();
+
+        wff_filter(wff_in.view(), window.view(), threshold, wff_out.view_mut(), tx);
+    });
+
+    for idx in rx.iter() {
+        bar.set_position(idx as u64);
+    }
+
+    bar.finish_with_message("Done");
+    
+    let wff_out = Arc::try_unwrap(wff_out).unwrap().into_inner().unwrap();
+    let wphase_filtered = wff_out.mapv(|e| e.arg());
+    let quality = wff_out.mapv(|e| e.norm());
+
+    drop(wff_out);
+    
+    let mut uphase = Array2::<f64>::zeros(wphase.dim());
+    let weights = Array2::<f64>::ones(wphase.dim());
+    
+    println!("Unwrapping");
+    dct_solve_iterative(wphase_filtered.view(), weights.view(), uphase.view_mut());
+    println!("Done");
+    
+    uphase.write_npy(File::create(&args.unwrapped)?)?;
+
+    if let Some(path) = args.filtered.as_ref() {
+        wphase_filtered.write_npy(File::create(path)?)?;
+    }
+
+    if let Some(path) = args.quality.as_ref() {
+        quality.write_npy(File::create(path)?)?;
+    }
     
     Ok(())
 }
 
+/*fn qgpu(wphase: ArrayView2<f64>, quality: ArrayView2<f64>, mut uphase: ArrayViewMut2<f64>) {
+    let start = quality.indexed_iter()
+        .max_by(|(_, q0), (_, q1)| q0.total_cmp(q1))
+        .unwrap();
+    
+    let adjacent = vec![(start, quality[start])];
+
+    while adjacent.len() > 0 {
+        let best = adjacent.iter()
+            .max_by(|(_, q0), (_, q1)| q0.total_cmp(q1))
+            .unwrap()
+            .0;
+
+        x
+    }
+}*/
+
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
     window: ArrayView2<Complex<f64>>,
-    mut out: ArrayViewMut2<Complex<f64>>
+    threshold: f64,
+    mut out: ArrayViewMut2<Complex<f64>>,
+    idx_monitor: mpsc::Sender<usize>
 ) {
     let (h, w) = arr.dim();
     let (m, n) = window.dim();
 
-    let mut handler_x = ndrustfft::FftHandler::<f64>::new(w);
-    let mut handler_y = ndrustfft::FftHandler::<f64>::new(h);
-    let mut windowed = Array2::<Complex<f64>>::zeros((h, w));
-    let mut temp = Array2::<Complex<f64>>::zeros((h, w));
+    let mut handler_x = ndrustfft::FftHandler::<f64>::new(n);
+    let mut handler_y = ndrustfft::FftHandler::<f64>::new(m);
+    let mut windowed = Array2::<Complex<f64>>::zeros((m, n));
+    let mut temp = Array2::<Complex<f64>>::zeros((m, n));
+    let mut expanded = Array2::<Complex<f64>>::zeros((h+m, w+n));
+    let mut expanded_out = Array2::<Complex<f64>>::zeros((h+m, w+n));
     
-    let freqs = fft2_freqs(w, h);
-    let threshold = 0.6*(m as f64).hypot(n as f64);
+    let freqs = fft2_freqs(m, n);
+    let threshold = threshold*(m as f64*n as f64).sqrt();
+
+    let (rx0, ry0) = (n/2, m/2);
+    let (rx1, ry1) = (rx0+w, ry0+h);
+
+    expanded.slice_mut(s![ry0..ry1, rx0..rx1]).assign(&arr);
+    expanded.slice_mut(s![..ry0, ..rx0]).assign(&arr.slice(s![..ry0;-1, ..rx0;-1]));
+    expanded.slice_mut(s![..ry0, rx0..rx1]).assign(&arr.slice(s![..ry0;-1, ..]));
+    expanded.slice_mut(s![..ry0, rx1..]).assign(&arr.slice(s![..ry0;-1, rx1-n..;-1]));
+    expanded.slice_mut(s![ry0..ry1, rx1..]).assign(&arr.slice(s![.., rx1-n..;-1]));
+    expanded.slice_mut(s![ry1.., rx1..]).assign(&arr.slice(s![ry1-m..;-1, rx1-n..;-1]));
+    expanded.slice_mut(s![ry1.., rx0..rx1]).assign(&arr.slice(s![ry1-m..;-1, ..]));
+    expanded.slice_mut(s![ry1.., ..rx0]).assign(&arr.slice(s![ry1-m..;-1, ..rx0;-1]));
+    expanded.slice_mut(s![ry0..ry1, ..rx0]).assign(&arr.slice(s![.., ..rx0;-1]));
+    
+    use ndrustfft::{ndfft, ndifft};
 
     for i in 0..h {
         for j in 0..w {
-            println!("Calculating row {i} col {j} out of {h}x{w}");
-
-            let (i0, wi0) = if i < m/2 { (0, m/2-i) } else { (i-m/2, 0) };
-            let (j0, wj0) = if j < n/2 { (0, n/2-j) } else { (j-n/2, 0) };
-            let (i1, wi1) = if i+(m-m/2) > h { (h, m/2+h-i) } else { (i+(m-m/2), m) };
-            let (j1, wj1) = if j+(n-n/2) > w { (w, n/2+w-j) } else { (j+(n-n/2), n) };
-
             // --- Forward WFT ---
-            windowed.assign(&arr);
-            windowed.slice_mut(s![..i0, ..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i1.., ..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, ..j0]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, j1..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, j0..j1])
-                .mul_assign(&window.slice(s![wi0..wi1, wj0..wj1]));
+            windowed.assign(&expanded.slice(s![i..i+m, j..j+n]));
+            windowed *= &window;
             
-            ndfft_par(&windowed, &mut temp, &mut handler_x, 1);
-            ndfft_par(&temp, &mut windowed, &mut handler_y, 0);
+            ndfft(&windowed, &mut temp, &mut handler_x, 1);
+            ndfft(&temp, &mut windowed, &mut handler_y, 0);
             // -------------------
 
-            par_azip!((f in freqs.rows(), w in &mut windowed) {
+            azip!((f in freqs.rows(), w in &mut windowed) {
                 if w.norm() < threshold || f[0].abs() > 0.25 || f[1].abs() > 0.25 {
                     *w = Complex { re: 0., im: 0. };
                 }
             });
             
             // --- Inverse WFT ---
-            ndifft_par(&windowed, &mut temp, &mut handler_x, 1);
-            ndifft_par(&temp, &mut windowed, &mut handler_y, 0);
+            ndifft(&windowed, &mut temp, &mut handler_x, 1);
+            ndifft(&temp, &mut windowed, &mut handler_y, 0);
             
-            windowed.slice_mut(s![..i0, ..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i1.., ..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, ..j0]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, j1..]).fill(Complex::new(0., 0.));
-            windowed.slice_mut(s![i0..i1, j0..j1])
-                .mul_assign(&window.slice(s![wi0..wi1, wj0..wj1]));
+            windowed *= &window; // Yes, multiply by the window again
 
-            out += &windowed;
+            expanded_out.slice_mut(s![i..i+m, j..j+n]).add_assign(&windowed);
             // -------------------
         }
+
+        idx_monitor.send(i*w).unwrap();
     }
+
+    out.assign(&expanded_out.slice(s![ry0..ry1, rx0..rx1]));
 }
 
 // Slow Picard iterative method, algorithm 2 from Ghiglia & Romero 1994
