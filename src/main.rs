@@ -11,18 +11,20 @@ use std::thread;
 use std::sync::{mpsc, Arc, Mutex};
 use std::path::PathBuf;
 use indicatif::{ProgressBar, ProgressStyle};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use anyhow;
 
 
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UnwrapMethod {
+    DCT, TIE, QGP
+}
 
 #[derive(Parser)]
 struct Args {
     /// Numpy array file (.npy) containing a 2D array of wrapped phases
     wrapped: PathBuf,
-
-    /// Destination file for the unwrapped phases
-    unwrapped: PathBuf,
     
     #[arg(short, long, default_value_t = 1.7)]
     /// Standard deviation of the Gaussian window used for windowed Fourier filtering
@@ -32,12 +34,20 @@ struct Args {
     /// Threshold used for removing Fourier coefficients of small magnitude
     threshold: f64,
 
+    #[arg(long, value_enum, value_name = "METHOD", default_value_t = UnwrapMethod::DCT)]
+    /// Method to use for unwrapping the filtered phase
+    unwrap_method: UnwrapMethod,
+
     #[arg(short, long, value_name = "FILE")]
-    /// Output the image quality map in addition to the unwrapped phase
+    /// Output the unwrapped phase
+    unwrapped: Option<PathBuf>,
+
+    #[arg(short, long, value_name = "FILE")]
+    /// Output the image quality map
     quality: Option<PathBuf>,
 
     #[arg(short, long, value_name = "FILE")]
-    /// Output the filtered wrapped phase in addition to the unwrapped phase
+    /// Output the filtered wrapped phase
     filtered: Option<PathBuf>
 }
 
@@ -45,6 +55,12 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.unwrapped.is_none() && args.quality.is_none() && args.filtered.is_none() {
+        eprintln!("No output files specified. Exiting.");
+        return Ok(());
+    }
+
     let wphase = Array2::<f64>::read_npy(File::open(&args.wrapped)?)?;
 
     println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
@@ -90,15 +106,29 @@ fn main() -> anyhow::Result<()> {
     let quality = wff_out.mapv(|e| e.norm());
 
     drop(wff_out);
-    
-    let mut uphase = Array2::<f64>::zeros(wphase.dim());
-    let weights = Array2::<f64>::ones(wphase.dim());
-    
-    println!("Unwrapping");
-    dct_solve_iterative(wphase_filtered.view(), weights.view(), uphase.view_mut());
-    println!("Done");
-    
-    uphase.write_npy(File::create(&args.unwrapped)?)?;
+
+    if let Some(path) = args.unwrapped.as_ref() {
+        let mut uphase = Array2::<f64>::zeros(wphase.dim());
+        let weights = Array2::<f64>::ones(wphase.dim());
+        
+        println!("Unwrapping...");
+        
+        match args.unwrap_method {
+            UnwrapMethod::DCT => {
+                dct_solve_iterative(wphase_filtered.view(), weights.view(), uphase.view_mut());
+            },
+            UnwrapMethod::TIE => {
+                tie_solve(wphase_filtered.view(), uphase.view_mut());
+            },
+            UnwrapMethod::QGP => {
+                println!("Quality Guided Path not yet implemented.");
+            }
+        }
+
+        println!("Done");
+
+        uphase.write_npy(File::create(path)?)?;
+    }
 
     if let Some(path) = args.filtered.as_ref() {
         wphase_filtered.write_npy(File::create(path)?)?;
