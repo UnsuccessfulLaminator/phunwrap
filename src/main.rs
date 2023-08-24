@@ -7,15 +7,16 @@ use crate::util::fft2_freqs;
 use ndarray::prelude::*;
 use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use ndrustfft::{Complex, ndfft, ndifft};
+use image::io::Reader as ImageReader;
 use std::fs::File;
 use std::f64::consts::TAU;
 use std::ops::AddAssign;
 use std::thread;
 use std::sync::mpsc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser, ValueEnum};
-use anyhow;
+use anyhow::{self, Context};
 
 
 
@@ -63,8 +64,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("No output files specified. Exiting.");
         return Ok(());
     }
-
-    let wphase = Array2::<f64>::read_npy(File::open(&args.wrapped)?)?;
+    
+    let wphase = load_phase_array(&args.wrapped)?;
 
     println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
     
@@ -161,7 +162,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
     window: ArrayView2<Complex<f64>>,
@@ -225,4 +225,39 @@ fn wff_filter(
     }
 
     out.assign(&expanded_out.slice(s![ry0..ry1, rx0..rx1]));
+}
+
+// Loads from a numpy .npy file or from any kind of image. If it loads from an
+// image, the values are scaled to lie in the range [-pi, pi].
+fn load_phase_array(path: &Path) -> anyhow::Result<Array2<f64>> {
+    let name = path.display();
+
+    Ok(if path.extension().is_some_and(|e| e == "npy") {
+        let f = File::open(&path)
+            .with_context(|| format!("Couldn't open {}", &name))?;
+
+        Array2::<f64>::read_npy(f)
+            .with_context(|| format!("Error reading npy data from {}", &name))?
+    }
+    else {
+        let image = ImageReader::open(&path)
+            .with_context(|| format!("Couldn't open {}", &name))?
+            .decode()
+            .with_context(|| format!("Error decoding image data from {}", &name))?
+            .to_luma32f();
+        
+        let (w, h) = image.dimensions();
+        let mut max = f64::MIN;
+
+        let data = image.to_vec()
+            .into_iter()
+            .map(|v| v as f64)
+            .inspect(|&v| if v > max { max = v; })
+            .collect();
+        
+        let mut arr = Array2::from_shape_vec((h as usize, w as usize), data).unwrap();
+        
+        arr.mapv_inplace(|v| (v/max-0.5)*TAU);
+        arr
+    })
 }
