@@ -1,9 +1,9 @@
-use std::sync::mpsc;
 use std::ops::{SubAssign, AddAssign};
 use std::f64::consts::{PI, TAU};
 use ndarray::prelude::*;
 use ndarray::par_azip;
 use ndrustfft::{DctHandler, nddct2_par, nddct3_par};
+use flume;
 
 
 
@@ -14,7 +14,7 @@ pub fn unwrap_picard(
     weights: ArrayView2<f64>,
     iterations: usize,
     mut unwrapped: ArrayViewMut2<f64>,
-    monitor: mpsc::Sender<usize>
+    monitor: flume::Sender<usize>
 ) {
     let (h, w) = wrapped.dim();
     let mut handler_x = ndrustfft::DctHandler::<f64>::new(w);

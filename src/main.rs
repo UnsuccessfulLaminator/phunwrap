@@ -12,11 +12,11 @@ use std::fs::File;
 use std::f64::consts::TAU;
 use std::ops::AddAssign;
 use std::thread;
-use std::sync::mpsc;
 use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser, ValueEnum};
 use anyhow::{self, Context};
+use flume;
 
 
 
@@ -38,7 +38,7 @@ struct Args {
     /// Threshold used for removing Fourier coefficients of small magnitude
     threshold: f64,
 
-    #[arg(long, value_enum, value_name = "METHOD", default_value_t = UnwrapMethod::DCT)]
+    #[arg(long, value_enum, value_name = "METHOD", default_value_t = UnwrapMethod::QGP)]
     /// Method to use for unwrapping the filtered phase
     unwrap_method: UnwrapMethod,
 
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
     let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = flume::unbounded();
     let template = "{prefix} ({elapsed}) [{wide_bar:.cyan/blue}] {pos}/{len} {msg} ({eta})";
     let bar = ProgressBar::new(wphase.len() as u64);
     let bar_clone = bar.clone();
@@ -96,8 +96,8 @@ fn main() -> anyhow::Result<()> {
     bar.set_message("pixels");
     
     let handle = thread::spawn(move || {
-        for idx in rx.iter() {
-            bar_clone.set_position(idx as u64);
+        for inc in rx.iter() {
+            bar_clone.inc(inc as u64);
         }
     });
     
@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = args.unwrapped.as_ref() {
         let mut uphase = Array2::<f64>::zeros(wphase.dim());
         
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = flume::unbounded();
         let bar_clone = bar.clone();
         let handle = thread::spawn(move || {
             for idx in rx.iter() {
@@ -167,64 +167,87 @@ fn wff_filter(
     window: ArrayView2<Complex<f64>>,
     threshold: f64,
     mut out: ArrayViewMut2<Complex<f64>>,
-    idx_monitor: mpsc::Sender<usize>
+    idx_monitor: flume::Sender<usize>
 ) {
     let (h, w) = arr.dim();
     let (m, n) = window.dim();
 
-    let mut handler_x = ndrustfft::FftHandler::<f64>::new(n);
-    let mut handler_y = ndrustfft::FftHandler::<f64>::new(m);
-    let mut windowed = Array2::<Complex<f64>>::zeros((m, n));
-    let mut temp = Array2::<Complex<f64>>::zeros((m, n));
+    let handler_x = ndrustfft::FftHandler::<f64>::new(n);
+    let handler_y = ndrustfft::FftHandler::<f64>::new(m);
+    let freqs = fft2_freqs(m, n);
+    let threshold = threshold*(m as f64*n as f64).sqrt();
+    
     let mut expanded = Array2::<Complex<f64>>::zeros((h+m, w+n));
     let mut expanded_out = Array2::<Complex<f64>>::zeros((h+m, w+n));
     
-    let freqs = fft2_freqs(m, n);
-    let threshold = threshold*(m as f64*n as f64).sqrt();
+    expand_mirrored(arr.view(), expanded.view_mut());
+    
+    let (tx, rx) = flume::unbounded();
+    let window_copy = window.to_owned();
 
-    let (rx0, ry0) = (n/2, m/2);
-    let (rx1, ry1) = (rx0+w, ry0+h);
+    let handle = std::thread::spawn(move || {
+        ndarray::par_azip!((index (i, j), awin in expanded.windows((m, n))) {
+            let mut handler_x = handler_x.clone();
+            let mut handler_y = handler_y.clone();
+            let mut windowed = &awin * &window_copy;
+            let mut temp = Array2::zeros((m, n));
 
-    expanded.slice_mut(s![ry0..ry1, rx0..rx1]).assign(&arr);
-    expanded.slice_mut(s![..ry0, ..rx0]).assign(&arr.slice(s![..ry0;-1, ..rx0;-1]));
-    expanded.slice_mut(s![..ry0, rx0..rx1]).assign(&arr.slice(s![..ry0;-1, ..]));
-    expanded.slice_mut(s![..ry0, rx1..]).assign(&arr.slice(s![..ry0;-1, rx1-n..;-1]));
-    expanded.slice_mut(s![ry0..ry1, rx1..]).assign(&arr.slice(s![.., rx1-n..;-1]));
-    expanded.slice_mut(s![ry1.., rx1..]).assign(&arr.slice(s![ry1-m..;-1, rx1-n..;-1]));
-    expanded.slice_mut(s![ry1.., rx0..rx1]).assign(&arr.slice(s![ry1-m..;-1, ..]));
-    expanded.slice_mut(s![ry1.., ..rx0]).assign(&arr.slice(s![ry1-m..;-1, ..rx0;-1]));
-    expanded.slice_mut(s![ry0..ry1, ..rx0]).assign(&arr.slice(s![.., ..rx0;-1]));
-
-    for i in 0..h {
-        for j in 0..w {
-            // --- Forward WFT ---
-            windowed.assign(&expanded.slice(s![i..i+m, j..j+n]));
-            windowed *= &window;
-            
             ndfft(&windowed, &mut temp, &mut handler_x, 1);
             ndfft(&temp, &mut windowed, &mut handler_y, 0);
-            // -------------------
 
             azip!((f in freqs.rows(), w in &mut windowed) {
                 if w.norm() < threshold || f[0].abs() > 0.25 || f[1].abs() > 0.25 {
-                    *w = Complex { re: 0., im: 0. };
+                    *w = Complex::new(0., 0.);
                 }
             });
-            
-            // --- Inverse WFT ---
+
             ndifft(&windowed, &mut temp, &mut handler_x, 1);
             ndifft(&temp, &mut windowed, &mut handler_y, 0);
-            
-            windowed *= &window; // Yes, multiply by the window again
 
-            expanded_out.slice_mut(s![i..i+m, j..j+n]).add_assign(&windowed);
-            // -------------------
-        }
+            windowed *= &window_copy;
 
-        idx_monitor.send(i*w).unwrap();
+            tx.send(((i, j), windowed)).unwrap();
+
+            if j == 0 { idx_monitor.send(w).unwrap(); }
+        });
+    });
+
+    for ((i, j), windowed) in rx.iter() {
+        expanded_out.slice_mut(s![i..i+m, j..j+n]).add_assign(&windowed);
     }
 
-    out.assign(&expanded_out.slice(s![ry0..ry1, rx0..rx1]));
+    handle.join().unwrap();
+    
+    assign_center(expanded_out.view(), out.view_mut());
+}
+
+// Copy the center of a bigger 2D array (arr) into a smaller one (out)
+fn assign_center<F: Clone>(arr: ArrayView2<F>, out: ArrayViewMut2<F>) {
+    let (h, w) = out.dim();
+    let (m, n) = (arr.nrows()-h, arr.ncols()-w);
+    let (x0, y0) = (n/2, m/2);
+    let (x1, y1) = (x0+w, y0+h);
+    
+    arr.slice(s![y0..y1, x0..x1]).assign_to(out);
+}
+
+// Place a smaller 2D array (arr) in the center of a bigger one (out) and fill
+// the space space around it by mirroring it outwards
+fn expand_mirrored<F: Clone>(arr: ArrayView2<F>, mut out: ArrayViewMut2<F>) {
+    let (h, w) = arr.dim();
+    let (m, n) = (out.nrows()-h, out.ncols()-w);
+    let (x0, y0) = (n/2, m/2);
+    let (x1, y1) = (x0+w, y0+h);
+
+    out.slice_mut(s![y0..y1, x0..x1]).assign(&arr);
+    out.slice_mut(s![..y0, ..x0]).assign(&arr.slice(s![..y0;-1, ..x0;-1]));
+    out.slice_mut(s![..y0, x0..x1]).assign(&arr.slice(s![..y0;-1, ..]));
+    out.slice_mut(s![..y0, x1..]).assign(&arr.slice(s![..y0;-1, x1-n..;-1]));
+    out.slice_mut(s![y0..y1, x1..]).assign(&arr.slice(s![.., x1-n..;-1]));
+    out.slice_mut(s![y1.., x1..]).assign(&arr.slice(s![y1-m..;-1, x1-n..;-1]));
+    out.slice_mut(s![y1.., x0..x1]).assign(&arr.slice(s![y1-m..;-1, ..]));
+    out.slice_mut(s![y1.., ..x0]).assign(&arr.slice(s![y1-m..;-1, ..x0;-1]));
+    out.slice_mut(s![y0..y1, ..x0]).assign(&arr.slice(s![.., ..x0;-1]));
 }
 
 // Loads from a numpy .npy file or from any kind of image. If it loads from an

@@ -1,7 +1,7 @@
-use std::sync::mpsc;
 use std::collections::BinaryHeap;
 use std::f64::consts::TAU;
 use ndarray::prelude::*;
+use flume;
 
 
 
@@ -47,7 +47,7 @@ pub fn unwrap(
     wphase: ArrayView2<f64>,
     quality: ArrayView2<f64>,
     mut uphase: ArrayViewMut2<f64>,
-    idx_monitor: mpsc::Sender<usize>
+    idx_monitor: flume::Sender<usize>
 ) {
     let (h, w) = wphase.dim();
     let (start_ij, &start_q) = quality.indexed_iter()
