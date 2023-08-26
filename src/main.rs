@@ -5,6 +5,7 @@ mod dct;
 
 use crate::util::fft2_freqs;
 use ndarray::prelude::*;
+use ndarray::par_azip;
 use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use ndrustfft::{Complex, ndfft, ndifft};
 use image::io::Reader as ImageReader;
@@ -175,18 +176,18 @@ fn wff_filter(
     let handler_x = ndrustfft::FftHandler::<f64>::new(n);
     let handler_y = ndrustfft::FftHandler::<f64>::new(m);
     let freqs = fft2_freqs(m, n);
-    let threshold = threshold*(m as f64*n as f64).sqrt();
+    let threshold_sqr = threshold*threshold*(m as f64*n as f64);
     
     let mut expanded = Array2::<Complex<f64>>::zeros((h+m, w+n));
     let mut expanded_out = Array2::<Complex<f64>>::zeros((h+m, w+n));
+    let window_copy = window.to_owned();
     
-    expand_mirrored(arr.view(), expanded.view_mut());
+    pad(arr.view(), (m/2, n/2), true, expanded.view_mut());
     
     let (tx, rx) = flume::unbounded();
-    let window_copy = window.to_owned();
 
     let handle = std::thread::spawn(move || {
-        ndarray::par_azip!((index (i, j), awin in expanded.windows((m, n))) {
+        par_azip!((index (i, j), awin in expanded.windows((m, n))) {
             let mut handler_x = handler_x.clone();
             let mut handler_y = handler_y.clone();
             let mut windowed = &awin * &window_copy;
@@ -196,7 +197,7 @@ fn wff_filter(
             ndfft(&temp, &mut windowed, &mut handler_y, 0);
 
             azip!((f in freqs.rows(), w in &mut windowed) {
-                if w.norm() < threshold || f[0].abs() > 0.25 || f[1].abs() > 0.25 {
+                if w.norm_sqr() < threshold_sqr || f[0].abs() > 0.25 || f[1].abs() > 0.25 {
                     *w = Complex::new(0., 0.);
                 }
             });
@@ -231,23 +232,31 @@ fn assign_center<F: Clone>(arr: ArrayView2<F>, out: ArrayViewMut2<F>) {
     arr.slice(s![y0..y1, x0..x1]).assign_to(out);
 }
 
-// Place a smaller 2D array (arr) in the center of a bigger one (out) and fill
-// the space space around it by mirroring it outwards
-fn expand_mirrored<F: Clone>(arr: ArrayView2<F>, mut out: ArrayViewMut2<F>) {
+// Place a smaller 2D array (arr) into a bigger one (out) with the given offset,
+// and optionally fill the space space around it by mirroring it outwards.
+fn pad<F: Clone>(
+    arr: ArrayView2<F>,
+    offset: (usize, usize),
+    fill_mirrored: bool,
+    mut out: ArrayViewMut2<F>
+) {
     let (h, w) = arr.dim();
     let (m, n) = (out.nrows()-h, out.ncols()-w);
-    let (x0, y0) = (n/2, m/2);
+    let (x0, y0) = offset;
     let (x1, y1) = (x0+w, y0+h);
 
     out.slice_mut(s![y0..y1, x0..x1]).assign(&arr);
-    out.slice_mut(s![..y0, ..x0]).assign(&arr.slice(s![..y0;-1, ..x0;-1]));
-    out.slice_mut(s![..y0, x0..x1]).assign(&arr.slice(s![..y0;-1, ..]));
-    out.slice_mut(s![..y0, x1..]).assign(&arr.slice(s![..y0;-1, x1-n..;-1]));
-    out.slice_mut(s![y0..y1, x1..]).assign(&arr.slice(s![.., x1-n..;-1]));
-    out.slice_mut(s![y1.., x1..]).assign(&arr.slice(s![y1-m..;-1, x1-n..;-1]));
-    out.slice_mut(s![y1.., x0..x1]).assign(&arr.slice(s![y1-m..;-1, ..]));
-    out.slice_mut(s![y1.., ..x0]).assign(&arr.slice(s![y1-m..;-1, ..x0;-1]));
-    out.slice_mut(s![y0..y1, ..x0]).assign(&arr.slice(s![.., ..x0;-1]));
+
+    if fill_mirrored {
+        out.slice_mut(s![..y0, ..x0]).assign(&arr.slice(s![..y0;-1, ..x0;-1]));
+        out.slice_mut(s![..y0, x0..x1]).assign(&arr.slice(s![..y0;-1, ..]));
+        out.slice_mut(s![..y0, x1..]).assign(&arr.slice(s![..y0;-1, x1-n..;-1]));
+        out.slice_mut(s![y0..y1, x1..]).assign(&arr.slice(s![.., x1-n..;-1]));
+        out.slice_mut(s![y1.., x1..]).assign(&arr.slice(s![y1-m..;-1, x1-n..;-1]));
+        out.slice_mut(s![y1.., x0..x1]).assign(&arr.slice(s![y1-m..;-1, ..]));
+        out.slice_mut(s![y1.., ..x0]).assign(&arr.slice(s![y1-m..;-1, ..x0;-1]));
+        out.slice_mut(s![y0..y1, ..x0]).assign(&arr.slice(s![.., ..x0;-1]));
+    }
 }
 
 // Loads from a numpy .npy file or from any kind of image. If it loads from an
