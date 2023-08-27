@@ -35,7 +35,7 @@ struct Args {
     /// Standard deviation of the Gaussian window used for windowed Fourier filtering
     sigma: f64,
 
-    #[arg(short, long, default_value_t = 0.05)]
+    #[arg(short, long, default_value_t = 0.35)]
     /// Threshold used for removing Fourier coefficients of small magnitude
     threshold: f64,
 
@@ -70,16 +70,8 @@ fn main() -> anyhow::Result<()> {
 
     println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
     
-    let sigma = args.sigma;
-    let threshold = args.threshold/args.sigma;
-    let window_size = (7.*sigma).round() as usize;
-    let window = Array2::from_shape_fn((window_size, window_size), |(i, j)| {
-        let x = j as f64-(window_size/2) as f64;
-        let y = i as f64-(window_size/2) as f64;
-        let gaussian = (-(x*x+y*y)/(2.*sigma*sigma)).exp()/(sigma*sigma*TAU);
-
-        Complex::new(gaussian, 0.)
-    });
+    let threshold = args.threshold;
+    let window = gaussian_window(args.sigma);
 
     let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
     let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
@@ -163,6 +155,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gaussian_window(sigma: f64) -> Array2::<Complex<f64>> {
+    let size = (7.*sigma).round() as usize; // Captures ~99% of the gaussian
+    
+    Array2::from_shape_fn((size, size), |(i, j)| {
+        let x = j as f64-(size/2) as f64;
+        let y = i as f64-(size/2) as f64;
+        let gaussian = (-(x*x+y*y)/(2.*sigma*sigma)).exp()/(sigma*sigma*TAU);
+
+        Complex::new(gaussian, 0.)
+    })
+}
+
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
     window: ArrayView2<Complex<f64>>,
@@ -175,8 +179,9 @@ fn wff_filter(
 
     let handler_x = ndrustfft::FftHandler::<f64>::new(n);
     let handler_y = ndrustfft::FftHandler::<f64>::new(m);
-    let freqs = fft2_freqs(m, n);
-    let threshold_sqr = threshold*threshold*(m as f64*n as f64);
+    let threshold_sqr = threshold*threshold;
+    let low_pass = fft2_freqs(m, n)
+        .map_axis(Axis(2), |f| f[0].abs() < 0.25 && f[1].abs() < 0.25);
     
     let mut expanded = Array2::<Complex<f64>>::zeros((h+m, w+n));
     let mut expanded_out = Array2::<Complex<f64>>::zeros((h+m, w+n));
@@ -187,34 +192,41 @@ fn wff_filter(
     let (tx, rx) = flume::unbounded();
 
     let handle = std::thread::spawn(move || {
-        par_azip!((index (i, j), awin in expanded.windows((m, n))) {
+        par_azip!((index (i, _), awins in expanded.axis_windows(Axis(0), m)) {
             let mut handler_x = handler_x.clone();
             let mut handler_y = handler_y.clone();
-            let mut windowed = &awin * &window_copy;
+            let mut rwins = Array2::zeros((m, w+n));
+            let mut windowed = Array2::zeros((m, n));
             let mut temp = Array2::zeros((m, n));
+            
+            azip!((index (_, j), awin in awins.axis_windows(Axis(1), n)) {
+                windowed.assign(&awin);
+                windowed *= &window_copy;
 
-            ndfft(&windowed, &mut temp, &mut handler_x, 1);
-            ndfft(&temp, &mut windowed, &mut handler_y, 0);
+                ndfft(&windowed, &mut temp, &mut handler_x, 1);
+                ndfft(&temp, &mut windowed, &mut handler_y, 0);
 
-            azip!((f in freqs.rows(), w in &mut windowed) {
-                if w.norm_sqr() < threshold_sqr || f[0].abs() > 0.25 || f[1].abs() > 0.25 {
-                    *w = Complex::new(0., 0.);
-                }
+                azip!((&pass in &low_pass, w in &mut windowed) {
+                    if w.norm_sqr() < threshold_sqr || !pass {
+                        *w = Complex::new(0., 0.);
+                    }
+                });
+
+                ndifft(&windowed, &mut temp, &mut handler_x, 1);
+                ndifft(&temp, &mut windowed, &mut handler_y, 0);
+
+                windowed *= &window_copy;
+
+                rwins.slice_mut(s![.., j..j+n]).add_assign(&windowed);
             });
 
-            ndifft(&windowed, &mut temp, &mut handler_x, 1);
-            ndifft(&temp, &mut windowed, &mut handler_y, 0);
-
-            windowed *= &window_copy;
-
-            tx.send(((i, j), windowed)).unwrap();
-
-            if j == 0 { idx_monitor.send(w).unwrap(); }
+            tx.send((i, rwins)).unwrap();
+            idx_monitor.send(w).unwrap();
         });
     });
 
-    for ((i, j), windowed) in rx.iter() {
-        expanded_out.slice_mut(s![i..i+m, j..j+n]).add_assign(&windowed);
+    for (i, rwins) in rx.iter() {
+        expanded_out.slice_mut(s![i..i+m, ..]).add_assign(&rwins);
     }
 
     handle.join().unwrap();
