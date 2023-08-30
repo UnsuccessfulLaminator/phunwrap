@@ -27,15 +27,37 @@ enum UnwrapMethod {
 }
 
 #[derive(Parser)]
+#[command(author, about, long_about, verbatim_doc_comment)]
+/// Tool for filtering & unwrapping of a wrapped phase image.
+/// Author: Alc (2023)
+/// --help will print a more detailed description than -h
+///
+/// This tool performs Windowed Fourier Filtering (threshold + lowpass) of a
+/// wrapped phase image to produce a filtered image and a quality map. The WFF
+/// is based on [1], but the implementation is very much my own and significantly
+/// more optimised than the MATLAB code presented in that paper. In particular,
+/// it is parallelised and uses a constant square window rather than a gaussian.
+/// This allows it to run in seconds where the original algorithm took many minutes.
+///
+/// After this, the filtered image is unwrapped using one of a few possible methods:
+///     dct - Discrete Cosine Transform, algorithm 2 from [2]
+///     tie - Transport of Intensity Equation, single-pass algorithm from [3]
+///     qgp - Quality Guided Path [4], using binary heap adjacency queue
+/// For dct and qgp, the quality map is used to inform better unwrapping.
+///
+/// [1] Q Kemao, W Gao, and H Wang - "Windowed Fourier-filtered and quality-guided phase-unwrapping algorithm"
+/// [2] DC Ghiglia and LA Romero - "Robust two-dimensional weighted and unweighted phase unwrapping that uses fast transforms and iterative methods"
+/// [3] J Martinez-Carranza, K Falaggis, and T Kozacki - "Fast and accurate phase-unwrapping algorithm based on the transport of intensity equation"
+/// [4] X Su and W Chen - "Reliability-guided phase unwrapping algorithm: a review"
 struct Args {
     /// Numpy array file (.npy) containing a 2D array of wrapped phases
     wrapped: PathBuf,
     
-    #[arg(long, alias = "wsize", default_value_t = 12)]
+    #[arg(long, visible_alias = "wsize", default_value_t = 12)]
     /// Window size in pixels used for windowed Fourier filtering
     window_size: usize,
 
-    #[arg(long, alias = "wstride", default_value_t = 1)]
+    #[arg(long, visible_alias = "wstride", default_value_t = 1)]
     /// Shift in pixels from one window to the next
     window_stride: usize,
 
