@@ -47,7 +47,7 @@ pub fn unwrap(
     wphase: ArrayView2<f64>,
     quality: ArrayView2<f64>,
     mut uphase: ArrayViewMut2<f64>,
-    idx_monitor: flume::Sender<usize>
+    monitor: flume::Sender<usize>
 ) {
     let (h, w) = wphase.dim();
     let (start_ij, &start_q) = quality.indexed_iter()
@@ -88,6 +88,8 @@ pub fn unwrap(
 
         path[best.ij] = processed as u32;
 
-        idx_monitor.send(processed).unwrap();
+        if processed%100 == 0 {
+            monitor.send((processed*100)/wphase.len()).unwrap();
+        }
     }
 }

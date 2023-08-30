@@ -55,7 +55,7 @@ pub fn unwrap_picard(
         
         solve_poisson(p.view_mut(), &mut handler_x, &mut handler_y, unwrapped.view_mut());
 
-        monitor.send(i).unwrap();
+        monitor.send((i*100)/iterations).unwrap();
     }
 }
 

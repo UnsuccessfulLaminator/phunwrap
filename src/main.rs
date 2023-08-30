@@ -21,6 +21,28 @@ use flume;
 
 
 
+#[derive(Clone)]
+struct Region {
+    x: usize, y: usize, w: usize, h: usize
+}
+
+impl std::str::FromStr for Region {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let i = s.find('x').ok_or("No x found separating width and height".to_string())?;
+        let p1 = s[i+1..].find('+').ok_or("No +offset found".to_string())?+i+1;
+        let p2 = s[p1+1..].find('+').ok_or("Only one +offset found".to_string())?+p1+1;
+        
+        let w: usize = s[..i].parse().map_err(|_| "Invalid integer".to_string())?;
+        let h: usize = s[i+1..p1].parse().map_err(|_| "Invalid integer".to_string())?;
+        let x: usize = s[p1+1..p2].parse().map_err(|_| "Invalid integer".to_string())?;
+        let y: usize = s[p2+1..].parse().map_err(|_| "Invalid integer".to_string())?;
+
+        Ok(Self { x, y, w, h })
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum UnwrapMethod {
     DCT, TIE, QGP
@@ -52,6 +74,10 @@ enum UnwrapMethod {
 struct Args {
     /// Numpy array file (.npy) containing a 2D array of wrapped phases
     wrapped: PathBuf,
+    
+    #[arg(short, long)]
+    /// Rectangular region to crop the input to (no cropping if left unspecified)
+    region: Option<Region>,
     
     #[arg(long, visible_alias = "wsize", default_value_t = 12)]
     /// Window size in pixels used for windowed Fourier filtering
@@ -96,37 +122,20 @@ fn main() -> anyhow::Result<()> {
 
     println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
     
-    let threshold = args.threshold;
-    let wff_in = wphase.mapv(|v| Complex::new(0., v).exp());
-    let mut wff_out = Array2::<Complex<f64>>::zeros(wphase.dim());
-
-    let (tx, rx) = flume::unbounded();
-    let template = "{prefix} ({elapsed}) [{wide_bar:.cyan/blue}] {pos}/{len} {msg} ({eta})";
-    let bar = ProgressBar::new(wphase.len() as u64);
-    let bar_clone = bar.clone();
-    let bar_style = ProgressStyle::with_template(template)
-        .unwrap()
-        .progress_chars("#>-");
-    
-    bar.set_style(bar_style);
-    bar.set_prefix("Filtering");
-    bar.set_message("pixels");
-    
-    let handle = thread::spawn(move || {
-        for inc in rx.iter() {
-            bar_clone.inc(inc as u64);
-        }
+    let region = args.region.unwrap_or(Region {
+        x: 0, y: 0, w: wphase.ncols(), h: wphase.nrows()
     });
-    
-    wff_filter(
-        wff_in.view(), args.window_size, args.window_stride, threshold,
-        wff_out.view_mut(), tx
-    );
-    
-    handle.join().unwrap();
-    bar.finish();
 
-    println!("Filtered in {} seconds", bar.elapsed().as_secs_f32());
+    let Region { x, y, w, h } = region;
+    let wff_in = wphase.slice(s![y..y+h, x..x+w]).mapv(|v| Complex::new(0., v).exp());
+    let mut wff_out = Array2::<Complex<f64>>::zeros(wff_in.dim());
+    
+    wff_filter_visual(
+        wff_in.view(), args.window_size, args.window_stride, args.threshold,
+        wff_out.view_mut(),
+        "Filtering ({elapsed}) [{wide_bar:.cyan/blue}] {pos}% ({eta})",
+        "#>-"
+    );
     
     let wphase_filtered = wff_out.mapv(|e| e.arg());
     let quality = wff_out.mapv(|e| e.norm());
@@ -135,40 +144,14 @@ fn main() -> anyhow::Result<()> {
     drop(wff_out);
 
     if let Some(path) = args.unwrapped.as_ref() {
-        let mut uphase = Array2::<f64>::zeros(wphase.dim());
-        
-        let (tx, rx) = flume::unbounded();
-        let bar_clone = bar.clone();
-        let handle = thread::spawn(move || {
-            for idx in rx.iter() {
-                bar_clone.set_position(idx as u64);
-            }
-        });
-        
-        bar.reset();
-        bar.set_prefix("Unwrapping");
-        
-        match args.unwrap_method {
-            UnwrapMethod::DCT => {
-                bar.set_length(20);
-                bar.set_message("iterations");
+        let mut uphase = Array2::<f64>::zeros((h, w));
 
-                dct::unwrap_picard(
-                    wphase_filtered.view(), quality.view(), 20, uphase.view_mut(), tx
-                );
-            },
-            UnwrapMethod::TIE => {
-                tie::unwrap(wphase_filtered.view(), uphase.view_mut());
-            },
-            UnwrapMethod::QGP => {
-                qgpu::unwrap(wphase_filtered.view(), quality.view(), uphase.view_mut(), tx);
-            }
-        }
-
-        handle.join().unwrap();
-        bar.finish();
-        
-        println!("Unwrapped in {} seconds", bar.elapsed().as_secs_f32());
+        unwrap_visual(
+            wphase_filtered.view(), quality.view(), args.unwrap_method,
+            uphase.view_mut(),
+            "Unwrapping ({elapsed}) [{wide_bar:.cyan/blue}] {pos}% ({eta})",
+            "#>-"
+        );
 
         uphase.write_npy(File::create(path)?)?;
     }
@@ -184,13 +167,82 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Runs the specified unwrapping algorithm, displaying a progress bar
+fn unwrap_visual(
+    phase: ArrayView2<f64>,
+    quality: ArrayView2<f64>,
+    method: UnwrapMethod,
+    out: ArrayViewMut2<f64>,
+    bar_template: &str,
+    bar_progress_chars: &str
+) {
+    let (tx, rx) = flume::unbounded();
+    let bar = ProgressBar::new(100);
+    let bar_clone = bar.clone();
+    let bar_style = ProgressStyle::with_template(bar_template)
+        .unwrap()
+        .progress_chars(bar_progress_chars);
+    
+    bar.set_style(bar_style);
+    
+    let handle = thread::spawn(move || {
+        for percentage in rx.iter() {
+            bar_clone.set_position(percentage as u64);
+        }
+    });
+    
+    match method {
+        UnwrapMethod::DCT => dct::unwrap_picard(phase, quality, 20, out, tx),
+        UnwrapMethod::TIE => tie::unwrap(phase, out),
+        UnwrapMethod::QGP => qgpu::unwrap(phase, quality, out, tx)
+    }
+    
+    handle.join().unwrap();
+    bar.finish();
+
+    println!("Unwrapped in {} seconds", bar.elapsed().as_secs_f32());
+}
+
+// Runs wff_filter, displaying a progress bar
+fn wff_filter_visual(
+    arr: ArrayView2<Complex<f64>>,
+    window_size: usize,
+    window_stride: usize,
+    threshold: f64,
+    out: ArrayViewMut2<Complex<f64>>,
+    bar_template: &str,
+    bar_progress_chars: &str
+) {
+    let (tx, rx) = flume::unbounded();
+    let bar = ProgressBar::new(100);
+    let bar_clone = bar.clone();
+    let bar_style = ProgressStyle::with_template(bar_template)
+        .unwrap()
+        .progress_chars(bar_progress_chars);
+    
+    bar.set_style(bar_style);
+    
+    let handle = thread::spawn(move || {
+        for percentage in rx.iter() {
+            bar_clone.set_position(percentage as u64);
+        }
+    });
+    
+    wff_filter(arr, window_size, window_stride, threshold, out, tx);
+    
+    handle.join().unwrap();
+    bar.finish();
+
+    println!("Filtered in {} seconds", bar.elapsed().as_secs_f32());
+}
+
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
     window_size: usize,
     window_stride: usize,
     threshold: f64,
     mut out: ArrayViewMut2<Complex<f64>>,
-    idx_monitor: flume::Sender<usize>
+    monitor: flume::Sender<usize>
 ) {
     let (h, w) = arr.dim();
     let m = window_size;
@@ -236,9 +288,9 @@ fn wff_filter(
         });
     });
 
-    for (i, rwins) in rx.iter() {
+    for (count, (i, rwins)) in rx.iter().enumerate() {
         expanded_out.slice_mut(s![i..i+m, ..]).add_assign(&rwins);
-        idx_monitor.send(w*window_stride).unwrap();
+        monitor.send((count*100)/(h/window_stride)).unwrap();
     }
     
     // With stride > 1, different pixels will be affected by different numbers
