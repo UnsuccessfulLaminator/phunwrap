@@ -14,6 +14,7 @@ indicatif = "0.17.6"
 ndarray = "0.15.6"
 ndarray-npy = { version = "0.8.1", default-features = false }
 ndrustfft = "0.4.1"
+rayon = "1.7.0"
 
 [profile.release]
 opt-level = 3

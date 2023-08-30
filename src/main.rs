@@ -5,9 +5,9 @@ mod dct;
 
 use crate::util::fft2_freqs;
 use ndarray::prelude::*;
-use ndarray::par_azip;
 use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use ndrustfft::{Complex, ndfft, ndifft};
+use rayon::prelude::*;
 use image::io::Reader as ImageReader;
 use std::fs::File;
 use std::f64::consts::TAU;
@@ -31,9 +31,13 @@ struct Args {
     /// Numpy array file (.npy) containing a 2D array of wrapped phases
     wrapped: PathBuf,
     
-    #[arg(short, long, default_value_t = 12)]
-    /// Window size used for windowed Fourier filtering
-    window: usize,
+    #[arg(long, alias = "wsize", default_value_t = 12)]
+    /// Window size in pixels used for windowed Fourier filtering
+    window_size: usize,
+
+    #[arg(long, alias = "wstride", default_value_t = 1)]
+    /// Shift in pixels from one window to the next
+    window_stride: usize,
 
     #[arg(short, long, default_value_t = 0.35)]
     /// Threshold used for removing Fourier coefficients of small magnitude
@@ -92,7 +96,10 @@ fn main() -> anyhow::Result<()> {
         }
     });
     
-    wff_filter(wff_in.view(), args.window, threshold, wff_out.view_mut(), tx);
+    wff_filter(
+        wff_in.view(), args.window_size, args.window_stride, threshold,
+        wff_out.view_mut(), tx
+    );
     
     handle.join().unwrap();
     bar.finish();
@@ -158,6 +165,7 @@ fn main() -> anyhow::Result<()> {
 fn wff_filter(
     arr: ArrayView2<Complex<f64>>,
     window_size: usize,
+    window_stride: usize,
     threshold: f64,
     mut out: ArrayViewMut2<Complex<f64>>,
     idx_monitor: flume::Sender<usize>
@@ -178,17 +186,17 @@ fn wff_filter(
     let (tx, rx) = flume::unbounded();
 
     let handle = std::thread::spawn(move || {
-        par_azip!((index (i, _), awins in expanded.axis_windows(Axis(0), m)) {
+        (0..h).into_par_iter().step_by(window_stride).for_each(|i| {
             let mut handler = handler.clone();
             let mut afts = Array::zeros((m, w+m));
             let mut rwins = Array2::zeros((m, w+m));
             let mut windowed = Array2::zeros((m, m));
             let mut temp = Array2::zeros((m, m));
             
-            ndfft(&awins, &mut afts, &mut handler, 0);
-            
-            azip!((index (_, j), aft in afts.axis_windows(Axis(1), m)) {
-                ndfft(&aft, &mut windowed, &mut handler, 1);
+            ndfft(&expanded.slice(s![i..i+m, ..]), &mut afts, &mut handler, 0);
+
+            for j in (0..w).step_by(window_stride) {
+                ndfft(&afts.slice(s![.., j..j+m]), &mut windowed, &mut handler, 1);
 
                 azip!((&pass in &low_pass, w in &mut windowed) {
                     if w.norm_sqr() < threshold_sqr || !pass {
@@ -200,17 +208,33 @@ fn wff_filter(
                 ndifft(&temp, &mut windowed, &mut handler, 0);
 
                 rwins.slice_mut(s![.., j..j+m]).add_assign(&windowed);
-            });
+            }
 
             tx.send((i, rwins)).unwrap();
-            idx_monitor.send(w).unwrap();
         });
     });
 
     for (i, rwins) in rx.iter() {
         expanded_out.slice_mut(s![i..i+m, ..]).add_assign(&rwins);
+        idx_monitor.send(w*window_stride).unwrap();
     }
+    
+    // With stride > 1, different pixels will be affected by different numbers
+    // of windows. For example with size = 7, stride = 3, an ideally infinite
+    // 1D image would have pixels affected by ...3, 2, 2, 3, 2, 2, 3, 2, 2...
+    // This calculates that pattern, `pat`, and divides the image to reduce
+    // each pixel to the mean of the window values added to it.
+    let s = window_stride as f64;
+    let pat: Array1<f64> = (0..w.max(h)+m)
+        .map(|i| i as f64)
+        .map(|i| (i/s).floor()-((i-m as f64)/s).floor())
+        .collect();
 
+    azip!((index (i, j), v in &mut expanded_out) {
+        *v /= pat[i]*pat[j];
+    });
+    
+    // Wait for the producer thread to finish (unnecessary but good practice)
     handle.join().unwrap();
     
     assign_center(expanded_out.view(), out.view_mut());
