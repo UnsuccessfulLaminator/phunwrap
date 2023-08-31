@@ -130,7 +130,7 @@ fn main() -> anyhow::Result<()> {
     let wff_in = wphase.slice(s![y..y+h, x..x+w]).mapv(|v| Complex::new(0., v).exp());
     let mut wff_out = Array2::<Complex<f64>>::zeros(wff_in.dim());
     
-    wff_filter_visual(
+    wff_filter_with_progress(
         wff_in.view(), args.window_size, args.window_stride, args.threshold,
         wff_out.view_mut(),
         "Filtering ({elapsed}) [{wide_bar:.cyan/blue}] {pos}% ({eta})",
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = args.unwrapped.as_ref() {
         let mut uphase = Array2::<f64>::zeros((h, w));
 
-        unwrap_visual(
+        unwrap_with_progress(
             wphase_filtered.view(), quality.view(), args.unwrap_method,
             uphase.view_mut(),
             "Unwrapping ({elapsed}) [{wide_bar:.cyan/blue}] {pos}% ({eta})",
@@ -167,14 +167,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Runs the specified unwrapping algorithm, displaying a progress bar
-fn unwrap_visual(
-    phase: ArrayView2<f64>,
-    quality: ArrayView2<f64>,
-    method: UnwrapMethod,
-    out: ArrayViewMut2<f64>,
+fn run_with_progress<F: FnOnce(flume::Sender<usize>)>(
     bar_template: &str,
-    bar_progress_chars: &str
+    bar_progress_chars: &str,
+    f: F
 ) {
     let (tx, rx) = flume::unbounded();
     let bar = ProgressBar::new(100);
@@ -191,20 +187,32 @@ fn unwrap_visual(
         }
     });
     
-    match method {
-        UnwrapMethod::DCT => dct::unwrap_picard(phase, quality, 20, out, tx),
-        UnwrapMethod::TIE => tie::unwrap(phase, out),
-        UnwrapMethod::QGP => qgpu::unwrap(phase, quality, out, tx)
-    }
+    f(tx);
     
     handle.join().unwrap();
     bar.finish();
 
-    println!("Unwrapped in {} seconds", bar.elapsed().as_secs_f32());
+    println!("Done in {} seconds", bar.elapsed().as_secs_f32());
 }
 
-// Runs wff_filter, displaying a progress bar
-fn wff_filter_visual(
+fn unwrap_with_progress(
+    phase: ArrayView2<f64>,
+    quality: ArrayView2<f64>,
+    method: UnwrapMethod,
+    out: ArrayViewMut2<f64>,
+    bar_template: &str,
+    bar_progress_chars: &str
+) {
+    run_with_progress(bar_template, bar_progress_chars, move |tx| {
+        match method {
+            UnwrapMethod::DCT => dct::unwrap_picard(phase, quality, 20, out, tx),
+            UnwrapMethod::TIE => tie::unwrap(phase, out),
+            UnwrapMethod::QGP => qgpu::unwrap(phase, quality, out, tx)
+        }
+    });
+}
+
+fn wff_filter_with_progress(
     arr: ArrayView2<Complex<f64>>,
     window_size: usize,
     window_stride: usize,
@@ -213,27 +221,9 @@ fn wff_filter_visual(
     bar_template: &str,
     bar_progress_chars: &str
 ) {
-    let (tx, rx) = flume::unbounded();
-    let bar = ProgressBar::new(100);
-    let bar_clone = bar.clone();
-    let bar_style = ProgressStyle::with_template(bar_template)
-        .unwrap()
-        .progress_chars(bar_progress_chars);
-    
-    bar.set_style(bar_style);
-    
-    let handle = thread::spawn(move || {
-        for percentage in rx.iter() {
-            bar_clone.set_position(percentage as u64);
-        }
+    run_with_progress(bar_template, bar_progress_chars, move |tx| {
+        wff_filter(arr, window_size, window_stride, threshold, out, tx);
     });
-    
-    wff_filter(arr, window_size, window_stride, threshold, out, tx);
-    
-    handle.join().unwrap();
-    bar.finish();
-
-    println!("Filtered in {} seconds", bar.elapsed().as_secs_f32());
 }
 
 fn wff_filter(

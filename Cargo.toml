@@ -2,7 +2,7 @@
 name = "phunwrap"
 version = "0.1.0"
 edition = "2021"
-author = "Alc"
+authors = ["Alc"]
 
 [dependencies]
 anyhow = "1.0.74"
