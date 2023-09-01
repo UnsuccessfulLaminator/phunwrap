@@ -10,6 +10,7 @@ use std::fs::File;
 use std::f64::consts::TAU;
 use std::thread;
 use std::path::{Path, PathBuf};
+use std::io::{BufWriter, Write};
 use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser, ValueEnum};
 use anyhow::{self, Context, bail};
@@ -102,18 +103,38 @@ struct Args {
 
     #[arg(short, long, value_name = "FILE")]
     /// Output the filtered wrapped phase
-    filtered: Option<PathBuf>
+    filtered: Option<PathBuf>,
+    
+    #[arg(short, long, value_name = "FILE")]
+    /// Output data as a Comma-Separated Value file
+    csv: Option<PathBuf>,
+
+    #[arg(
+        long, default_value = "xyufq", requires = "csv_output",
+        value_parser = check_csv_format
+    )]
+    /// Specify the contents of the CSV file as a character sequence. Valid chars
+    /// are x, y, u (unwrapped), f (filtered), and q (quality). For example, pass
+    /// `--csv-format xyuq` and the CSV file will contain only those values and
+    /// in that order.
+    csv_format: String
+}
+
+fn check_csv_format(format: &str) -> Result<String, String> {
+    if format.chars().all(|c| "xyufq".contains(c)) { Ok(format.to_string()) }
+    else { Err("CSV format must contain only characters from xyufq".to_string()) }
 }
 
 
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
-    if args.unwrapped.is_none() && args.quality.is_none() && args.filtered.is_none() {
+    
+    if args.unwrapped.is_none() && args.filtered.is_none()
+    && args.quality.is_none() && args.csv.is_none() {
         bail!("No output files specified");
     }
-    
+
     let wphase = load_phase_array(&args.wrapped)?;
 
     println!("Loaded wrapped phase array of shape {:?}", wphase.dim());
@@ -140,8 +161,9 @@ fn main() -> anyhow::Result<()> {
     
     drop(wff_in);
     drop(wff_out);
-
-    if let Some(path) = args.unwrapped.as_ref() {
+    
+    let need_unwrap = args.unwrapped.is_some() || args.csv_format.contains('u');
+    let uphase = need_unwrap.then(|| {
         let mut uphase = Array2::<f64>::zeros((h, w));
 
         unwrap_with_progress(
@@ -151,7 +173,11 @@ fn main() -> anyhow::Result<()> {
             "#>-"
         );
 
-        uphase.write_npy(File::create(path)?)?;
+        uphase
+    });
+
+    if let Some(path) = args.unwrapped.as_ref() {
+        uphase.as_ref().unwrap().write_npy(File::create(path)?)?;
     }
 
     if let Some(path) = args.filtered.as_ref() {
@@ -160,6 +186,38 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(path) = args.quality.as_ref() {
         quality.write_npy(File::create(path)?)?;
+    }
+
+    if let Some(path) = args.csv.as_ref() {
+        let mut file = BufWriter::new(File::create(path)?);
+
+        let titles: Vec<&str> = args.csv_format.chars().map(|c| match c {
+            'x' => "x",
+            'y' => "y",
+            'f' => "filtered",
+            'q' => "quality",
+            'u' => "unwrapped",
+            _ => panic!("Invalid CSV format char")
+        }).collect();
+
+        write!(file, "{}", titles.join(","))?;
+
+        for ((i, j), &f) in wphase_filtered.indexed_iter() {
+            if i > 0 && j > 0 { write!(file, "\n")?; }
+
+            for (k, c) in args.csv_format.chars().enumerate() {
+                if k > 0 { write!(file, ",")?; }
+
+                write!(file, "{}", match c {
+                    'x' => j as f64,
+                    'y' => i as f64,
+                    'f' => f,
+                    'q' => quality[[i, j]],
+                    'u' => uphase.as_ref().unwrap()[[i, j]],
+                    _ => panic!("Invalid CSV format char")
+                })?;
+            }
+        }
     }
     
     Ok(())
