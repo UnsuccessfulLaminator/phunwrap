@@ -63,6 +63,8 @@ pub fn unwrap(
     
     flags[start_ij] = PixelFlag::Adjacent;
 
+    let percent_step = (h*w)/100;
+
     while let Some(best) = adjacent.pop() {
         for (di, dj) in &adjacency_offsets {
             let (i, j) = (best.ij.0 as isize+di, best.ij.1 as isize+dj);
@@ -88,7 +90,7 @@ pub fn unwrap(
 
         path[best.ij] = processed as u32;
 
-        if processed%100 == 0 {
+        if processed%percent_step == 0 {
             monitor.send((processed*100)/wphase.len()).unwrap();
         }
     }
