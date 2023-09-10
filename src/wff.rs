@@ -42,6 +42,7 @@ pub fn filter(
 
             for j in (0..w).step_by(window_stride) {
                 ndfft(&afts.slice(s![.., j..j+m]), &mut windowed, &mut handler, 1);
+                dlap(windowed.view_mut(), temp.view_mut());
 
                 azip!((&pass in &low_pass, w in &mut windowed) {
                     if w.norm_sqr() < threshold_sqr || !pass {
@@ -49,6 +50,7 @@ pub fn filter(
                     }
                 });
 
+                dlap(windowed.view_mut(), temp.view_mut());
                 ndifft(&windowed, &mut temp, &mut handler, 1);
                 ndifft(&temp, &mut windowed, &mut handler, 0);
 
@@ -83,6 +85,30 @@ pub fn filter(
     handle.join().unwrap();
     
     assign_center(expanded_out.view(), out.view_mut());
+}
+
+fn dlap(mut arr: ArrayViewMut2<Complex<f64>>, mut temp: ArrayViewMut2<Complex<f64>>) {
+    roll(arr.view(), Axis(0), false, temp.view_mut());
+    arr -= &temp;
+    roll(arr.view(), Axis(0), true, temp.view_mut());
+    arr -= &temp;
+    roll(arr.view(), Axis(1), false, temp.view_mut());
+    arr -= &temp;
+    roll(arr.view(), Axis(1), true, temp.view_mut());
+    arr -= &temp;
+}
+
+fn roll<F: Clone>(arr: ArrayView2<F>, axis: Axis, rev: bool, mut out: ArrayViewMut2<F>) {
+    let l = arr.len_of(axis);
+    
+    if rev {
+        out.slice_axis_mut(axis, (..-1).into()).assign(&arr.slice_axis(axis, (1..).into()));
+        out.index_axis_mut(axis, l-1).assign(&arr.index_axis(axis, 0));
+    }
+    else {
+        out.slice_axis_mut(axis, (1..).into()).assign(&arr.slice_axis(axis, (..-1).into()));
+        out.index_axis_mut(axis, 0).assign(&arr.index_axis(axis, l-1));
+    }
 }
 
 // Copy the center of a bigger 2D array (arr) into a smaller one (out)
