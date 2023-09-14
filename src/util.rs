@@ -15,3 +15,30 @@ pub fn fft2_freqs(w: usize, h: usize) -> Array3<f64> {
 
     out
 }
+
+
+
+#[derive(Clone)]
+pub struct Region {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize
+}
+
+impl std::str::FromStr for Region {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let i = s.find('x').ok_or("No x found separating width and height".to_string())?;
+        let p1 = s[i+1..].find('+').ok_or("No +offset found".to_string())?+i+1;
+        let p2 = s[p1+1..].find('+').ok_or("Only one +offset found".to_string())?+p1+1;
+        
+        Ok(Self {
+            w: s[..i].parse().map_err(|_| "Invalid width".to_string())?,
+            h: s[i+1..p1].parse().map_err(|_| "Invalid height".to_string())?,
+            x: s[p1+1..p2].parse().map_err(|_| "Invalid x offset".to_string())?,
+            y: s[p2+1..].parse().map_err(|_| "Invalid y offset".to_string())?
+        })
+    }
+}

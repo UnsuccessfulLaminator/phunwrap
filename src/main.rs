@@ -2,9 +2,11 @@ mod util;
 mod wff;
 mod unwrap;
 
+use util::Region;
 use ndarray::prelude::*;
 use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use ndrustfft::Complex;
+use ndarray_linalg::LeastSquaresSvd;
 use image::io::Reader as ImageReader;
 use std::fs::File;
 use std::f64::consts::TAU;
@@ -17,28 +19,6 @@ use anyhow::{self, Context, bail};
 use flume;
 
 
-
-#[derive(Clone)]
-struct Region {
-    x: usize, y: usize, w: usize, h: usize
-}
-
-impl std::str::FromStr for Region {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let i = s.find('x').ok_or("No x found separating width and height".to_string())?;
-        let p1 = s[i+1..].find('+').ok_or("No +offset found".to_string())?+i+1;
-        let p2 = s[p1+1..].find('+').ok_or("Only one +offset found".to_string())?+p1+1;
-        
-        Ok(Self {
-            w: s[..i].parse().map_err(|_| "Invalid width".to_string())?,
-            h: s[i+1..p1].parse().map_err(|_| "Invalid height".to_string())?,
-            x: s[p1+1..p2].parse().map_err(|_| "Invalid x offset".to_string())?,
-            y: s[p2+1..].parse().map_err(|_| "Invalid y offset".to_string())?
-        })
-    }
-}
 
 #[derive(Clone, Copy, ValueEnum)]
 enum UnwrapMethod {
@@ -55,7 +35,7 @@ enum UnwrapMethod {
 /// wrapped phase image to produce a filtered image and a quality map. The WFF
 /// is based on [1], but the implementation is very much my own and significantly
 /// more optimised than the MATLAB code presented in that paper. In particular,
-/// it is parallelised and uses a constant square window rather than a gaussian.
+/// it is parallelised and uses a cosine window rather than a Gaussian.
 /// This allows it to run in seconds where the original algorithm took many minutes.
 ///
 /// After this, the filtered image is unwrapped using one of a few possible methods:
@@ -69,7 +49,7 @@ enum UnwrapMethod {
 /// [3] J Martinez-Carranza, K Falaggis, and T Kozacki - "Fast and accurate phase-unwrapping algorithm based on the transport of intensity equation"
 /// [4] X Su and W Chen - "Reliability-guided phase unwrapping algorithm: a review"
 struct Args {
-    /// Numpy array file (.npy) containing a 2D array of wrapped phases
+    /// Image or numpy array file containing a 2D array of wrapped phases
     wrapped: PathBuf,
     
     #[arg(short, long)]
@@ -85,7 +65,7 @@ struct Args {
     /// Shift in pixels from one window to the next
     window_stride: usize,
 
-    #[arg(short, long, default_value_t = 0.35)]
+    #[arg(short, long, default_value_t = 0.7)]
     /// Threshold used for removing Fourier coefficients of small magnitude
     threshold: f64,
 
@@ -93,6 +73,19 @@ struct Args {
     /// Method to use for unwrapping the filtered phase
     unwrap_method: UnwrapMethod,
 
+    #[arg(long, action)]
+    /// Subtract a phase ramp, f(x,y) = (ax+by+c)/(dx+ey+1), from the unwrapped phase.
+    /// Coefficients can be supplied with the --plane-coeffs option, otherwise they will
+    /// be found by least-squares fitting to the data, and printed.
+    subtract_plane: bool,
+
+    #[arg(
+        long, value_name = "COEFF", num_args = 5, allow_hyphen_values = true,
+        requires = "subtract_plane"
+    )]
+    /// The 5 coefficients of f(x,y) = (ax+by+c)/(dx+ey+1). See --subtract-plane.
+    plane_coeffs: Option<Vec<f64>>,
+    
     #[arg(short, long, value_name = "FILE")]
     /// Output the unwrapped phase
     unwrapped: Option<PathBuf>,
@@ -173,6 +166,23 @@ fn main() -> anyhow::Result<()> {
             "#>-"
         );
 
+        if args.subtract_plane {
+            let coeffs = args.plane_coeffs.unwrap_or_else(|| {
+                println!("Fit coefficients a,b,c,d,e:");
+
+                plane_fit(uphase.view())
+                    .into_iter()
+                    .inspect(|c| println!("{}", c))
+                    .collect()
+            });
+
+            azip!((index (i, j), u in &mut uphase) {
+                let (x, y) = (j as f64, i as f64);
+
+                *u -= (coeffs[0]*x+coeffs[1]*y+coeffs[2])/(coeffs[3]*x+coeffs[4]*y+1.);
+            });
+        }
+
         uphase
     });
 
@@ -221,6 +231,29 @@ fn main() -> anyhow::Result<()> {
     }
     
     Ok(())
+}
+
+// Fit the equation z = (ax2+bx+c)/(dx2+ex+1) to the given array of points,
+// which is a good approximation to the general equation for the phase image
+// produced by a plane target. Returns [a, b, c, d, e].
+fn plane_fit(arr: ArrayView2<f64>) -> Array1<f64> {
+    let (h, w) = arr.dim();
+    let mut matrix = Array2::<f64>::ones((w*h, 5)); // [[x, y, 1, -xz, -yz], ...]
+    let vec = Array1::<f64>::from_iter(arr.iter().cloned());
+
+    azip!((index (i, j), &z in &arr) {
+        let (x, y) = (j as f64, i as f64);
+        let point_idx = i*w+j;
+
+        matrix[[point_idx, 0]] = x;
+        matrix[[point_idx, 1]] = y;
+        matrix[[point_idx, 3]] = -x*z;
+        matrix[[point_idx, 4]] = -y*z;
+    });
+
+    matrix.least_squares(&vec)
+        .expect("Could not find least squares fit for given points")
+        .solution
 }
 
 fn run_with_progress<F: FnOnce(flume::Sender<usize>)>(
