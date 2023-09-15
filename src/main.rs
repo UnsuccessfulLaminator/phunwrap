@@ -155,7 +155,9 @@ fn main() -> anyhow::Result<()> {
     drop(wff_in);
     drop(wff_out);
     
-    let need_unwrap = args.unwrapped.is_some() || args.csv_format.contains('u');
+    let need_unwrap = args.unwrapped.is_some()
+        || ( args.csv.is_some() && args.csv_format.contains('u'));
+
     let uphase = need_unwrap.then(|| {
         let mut uphase = Array2::<f64>::zeros((h, w));
 
